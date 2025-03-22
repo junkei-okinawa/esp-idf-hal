@@ -1670,12 +1670,12 @@ mod chip {
     pin!(Gpio27:27, IO, RTC:17, ADC2:7, NODAC:0, TOUCH:7);
     pin!(Gpio32:32, IO, RTC:9, ADC1:4, NODAC:0, TOUCH:9);
     pin!(Gpio33:33, IO, RTC:8, ADC1:5, NODAC:0, TOUCH:8);
-    pin!(Gpio34:34, Input, RTC:4, ADC1:6, NODAC:0, NOTOUCH:0);
-    pin!(Gpio35:35, Input, RTC:5, ADC1:7, NODAC:0, NOTOUCH:0);
-    pin!(Gpio36:36, Input, RTC:0, ADC1:0, NODAC:0, NOTOUCH:0);
+    pin!(Gpio34:34, IO, RTC:4, ADC1:6, NODAC:0, NOTOUCH:0);
+    pin!(Gpio35:35, IO, RTC:5, ADC1:7, NODAC:0, NOTOUCH:0);
+    pin!(Gpio36:36, IO, RTC:0, ADC1:0, NODAC:0, NOTOUCH:0);
     pin!(Gpio37:37, Input, RTC:1, ADC1:1, NODAC:0, NOTOUCH:0);
     pin!(Gpio38:38, Input, RTC:2, ADC1:2, NODAC:0, NOTOUCH:0);
-    pin!(Gpio39:39, Input, RTC:3, ADC1:3, NODAC:0, NOTOUCH:0);
+    pin!(Gpio39:39, IO, RTC:3, ADC1:3, NODAC:0, NOTOUCH:0);
 
     pub struct Pins {
         pub gpio0: Gpio0,
