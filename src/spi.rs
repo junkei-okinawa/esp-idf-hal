@@ -16,7 +16,7 @@
 //! |   | 1-3 devices      |           Y          |              N               |              Y             |         N         |
 //! |   | 4-6 devices      |    Only on esp32CX   |              N               |              Y             |         N         |
 //! |   | More than 6      |           N          |              N               |              Y             |         N         |
-//! |   | DMA              |           N          |              N               |              N             |         N         |
+//! |   | DMA              |           Y          |              Y               |              Y             |         Y         |
 //! |   | Polling transmit |           Y          |              Y               |              Y             |         Y         |
 //! |   | ISR transmit     |           Y          |              Y               |              Y             |         Y         |
 //! |   | Async support*   |           Y          |              Y               |              Y             |         Y         |
@@ -30,7 +30,6 @@
 //! therefore may run at a different frequency.
 //!
 //! # TODO
-//! - Quad SPI
 //! - Slave SPI
 
 use core::borrow::{Borrow, BorrowMut};
@@ -49,22 +48,20 @@ use esp_idf_sys::*;
 use heapless::Deque;
 
 use crate::delay::{self, Ets, BLOCK};
-use crate::gpio::{
-    AnyIOPin, AnyOutputPin, InputPin, Level, Output, OutputMode, OutputPin, PinDriver,
-};
+use crate::gpio::{AnyOutputPin, IOPin, InputPin, Level, Output, OutputMode, OutputPin, PinDriver};
 use crate::interrupt::asynch::HalIsrNotification;
 use crate::interrupt::InterruptType;
 use crate::peripheral::Peripheral;
 use crate::task::embassy_sync::EspRawMutex;
 use crate::task::CriticalSection;
 
-pub use embedded_hal::spi::Operation;
-
 crate::embedded_hal_error!(
     SpiError,
     embedded_hal::spi::Error,
     embedded_hal::spi::ErrorKind
 );
+
+use config::{Duplex, LineWidth};
 
 pub trait Spi: Send {
     fn device() -> spi_host_device_t;
@@ -196,6 +193,16 @@ pub mod config {
                 Self::RxLsbFirst => SPI_DEVICE_RXBIT_LSBFIRST,
             }
         }
+    }
+
+    #[derive(Debug, Copy, Clone, Eq, PartialEq)]
+    pub enum LineWidth {
+        /// 1-bit, 2 wire duplex or 1 wire half-duplex
+        Single,
+        /// 2-bit, 2 wire half-duplex
+        Dual,
+        /// 4-bit, 4 wire half-duplex
+        Quad,
     }
 
     /// SPI Driver configuration
@@ -356,6 +363,58 @@ pub mod config {
             }
         }
     }
+
+    impl From<&Config> for spi_device_interface_config_t {
+        fn from(config: &Config) -> Self {
+            Self {
+                spics_io_num: -1,
+                clock_speed_hz: config.baudrate.0 as i32,
+                mode: data_mode_to_u8(config.data_mode),
+                queue_size: config.queue_size as i32,
+                flags: if config.write_only {
+                    SPI_DEVICE_NO_DUMMY
+                } else {
+                    0_u32
+                } | if config.cs_active_high {
+                    SPI_DEVICE_POSITIVE_CS
+                } else {
+                    0_u32
+                } | config.duplex.as_flags()
+                    | config.bit_order.as_flags(),
+                cs_ena_pretrans: config.cs_pre_delay_us.unwrap_or(0),
+                cs_ena_posttrans: config.cs_post_delay_us.unwrap_or(0),
+                ..Default::default()
+            }
+        }
+    }
+
+    fn data_mode_to_u8(data_mode: Mode) -> u8 {
+        (((data_mode.polarity == Polarity::IdleHigh) as u8) << 1)
+            | ((data_mode.phase == Phase::CaptureOnSecondTransition) as u8)
+    }
+}
+
+/// SPI transaction operation.
+///
+/// This allows composition of SPI operations into a single bus transaction.
+#[non_exhaustive]
+#[derive(Debug, PartialEq, Eq)]
+pub enum Operation<'a> {
+    /// Read data into the provided buffer.
+    Read(&'a mut [u8]),
+    /// Read data into the provided buffer with the provided line width in half-duplex mode.
+    ReadWithWidth(&'a mut [u8], LineWidth),
+    /// Write data from the provided buffer, discarding read data.
+    Write(&'a [u8]),
+    /// Write data from the provided buffer, using the provided line width in half-duplex mode,
+    /// discarding read data.
+    WriteWithWidth(&'a [u8], LineWidth),
+    /// Read data into the first buffer, while writing data from the second buffer.
+    Transfer(&'a mut [u8], &'a [u8]),
+    /// Write data out while reading data into the provided buffer.
+    TransferInPlace(&'a mut [u8]),
+    /// Delay for at least the specified number of nanoseconds.
+    DelayNs(u32),
 }
 
 pub struct SpiDriver<'d> {
@@ -378,7 +437,17 @@ impl<'d> SpiDriver<'d> {
         sdi: Option<impl Peripheral<P = crate::gpio::Gpio8> + 'd>,
         config: &config::DriverConfig,
     ) -> Result<Self, EspError> {
-        let max_transfer_size = Self::new_internal(SPI1::device(), Some(sclk), sdo, sdi, config)?;
+        use crate::gpio::Pin;
+
+        let max_transfer_size = Self::new_internal(
+            SPI1::device(),
+            Some(sclk.into_ref().pin()),
+            Some(sdo.into_ref().pin()),
+            sdi.map(|p| p.into_ref().pin()),
+            None,
+            None,
+            config,
+        )?;
 
         Ok(Self {
             host: SPI1::device() as _,
@@ -396,7 +465,15 @@ impl<'d> SpiDriver<'d> {
         sdi: Option<impl Peripheral<P = impl InputPin> + 'd>,
         config: &config::DriverConfig,
     ) -> Result<Self, EspError> {
-        let max_transfer_size = Self::new_internal(SPI::device(), Some(sclk), sdo, sdi, config)?;
+        let max_transfer_size = Self::new_internal(
+            SPI::device(),
+            Some(sclk.into_ref().pin()),
+            Some(sdo.into_ref().pin()),
+            sdi.map(|p| p.into_ref().pin()),
+            None,
+            None,
+            config,
+        )?;
 
         Ok(Self {
             host: SPI::device() as _,
@@ -412,8 +489,67 @@ impl<'d> SpiDriver<'d> {
         sdi: Option<impl Peripheral<P = impl InputPin> + 'd>,
         config: &config::DriverConfig,
     ) -> Result<Self, EspError> {
-        let max_transfer_size =
-            Self::new_internal(SPI::device(), Option::<AnyIOPin>::None, sdo, sdi, config)?;
+        let max_transfer_size = Self::new_internal(
+            SPI::device(),
+            None,
+            Some(sdo.into_ref().pin()),
+            sdi.map(|p| p.into_ref().pin()),
+            None,
+            None,
+            config,
+        )?;
+
+        Ok(Self {
+            host: SPI::device() as _,
+            max_transfer_size,
+            bus_async_lock: Mutex::new(()),
+            _p: PhantomData,
+        })
+    }
+
+    pub fn new_dual<SPI: SpiAnyPins>(
+        _spi: impl Peripheral<P = SPI> + 'd,
+        sclk: impl Peripheral<P = impl OutputPin> + 'd,
+        data0: impl Peripheral<P = impl IOPin> + 'd,
+        data1: impl Peripheral<P = impl IOPin> + 'd,
+        config: &config::DriverConfig,
+    ) -> Result<Self, EspError> {
+        let max_transfer_size = Self::new_internal(
+            SPI::device(),
+            Some(sclk.into_ref().pin()),
+            Some(data0.into_ref().pin()),
+            Some(data1.into_ref().pin()),
+            None,
+            None,
+            config,
+        )?;
+
+        Ok(Self {
+            host: SPI::device() as _,
+            max_transfer_size,
+            bus_async_lock: Mutex::new(()),
+            _p: PhantomData,
+        })
+    }
+
+    pub fn new_quad<SPI: SpiAnyPins>(
+        _spi: impl Peripheral<P = SPI> + 'd,
+        sclk: impl Peripheral<P = impl OutputPin> + 'd,
+        data0: impl Peripheral<P = impl IOPin> + 'd,
+        data1: impl Peripheral<P = impl IOPin> + 'd,
+        data2: impl Peripheral<P = impl IOPin> + 'd,
+        data3: impl Peripheral<P = impl IOPin> + 'd,
+        config: &config::DriverConfig,
+    ) -> Result<Self, EspError> {
+        let max_transfer_size = Self::new_internal(
+            SPI::device(),
+            Some(sclk.into_ref().pin()),
+            Some(data0.into_ref().pin()),
+            Some(data1.into_ref().pin()),
+            Some(data2.into_ref().pin()),
+            Some(data3.into_ref().pin()),
+            config,
+        )?;
 
         Ok(Self {
             host: SPI::device() as _,
@@ -429,41 +565,39 @@ impl<'d> SpiDriver<'d> {
 
     fn new_internal(
         host: spi_host_device_t,
-        sclk: Option<impl Peripheral<P = impl OutputPin> + 'd>,
-        sdo: impl Peripheral<P = impl OutputPin> + 'd,
-        sdi: Option<impl Peripheral<P = impl InputPin> + 'd>,
+        sclk: Option<i32>,
+        sdo: Option<i32>,
+        sdi: Option<i32>,
+        data2: Option<i32>,
+        data3: Option<i32>,
         config: &config::DriverConfig,
     ) -> Result<usize, EspError> {
-        let sdo = sdo.into_ref();
-        let sdi = sdi.map(|sdi| sdi.into_ref());
-        let sclk = sclk.map(|sclk| sclk.into_ref());
-
         let max_transfer_sz = config.dma.max_transfer_size();
         let dma_chan: spi_dma_chan_t = config.dma.into();
 
         #[allow(clippy::needless_update)]
         let bus_config = spi_bus_config_t {
             flags: SPICOMMON_BUSFLAG_MASTER,
-            sclk_io_num: sclk.as_ref().map_or(-1, |p| p.pin()),
+            sclk_io_num: sclk.unwrap_or(-1),
 
             data4_io_num: -1,
             data5_io_num: -1,
             data6_io_num: -1,
             data7_io_num: -1,
             __bindgen_anon_1: spi_bus_config_t__bindgen_ty_1 {
-                mosi_io_num: sdo.pin(),
+                mosi_io_num: sdo.unwrap_or(-1),
                 //data0_io_num: -1,
             },
             __bindgen_anon_2: spi_bus_config_t__bindgen_ty_2 {
-                miso_io_num: sdi.as_ref().map_or(-1, |p| p.pin()),
+                miso_io_num: sdi.unwrap_or(-1),
                 //data1_io_num: -1,
             },
             __bindgen_anon_3: spi_bus_config_t__bindgen_ty_3 {
-                quadwp_io_num: -1,
+                quadwp_io_num: data2.unwrap_or(-1),
                 //data2_io_num: -1,
             },
             __bindgen_anon_4: spi_bus_config_t__bindgen_ty_4 {
-                quadhd_io_num: -1,
+                quadhd_io_num: data3.unwrap_or(-1),
                 //data3_io_num: -1,
             },
             max_transfer_sz: max_transfer_sz as i32,
@@ -477,21 +611,22 @@ impl<'d> SpiDriver<'d> {
     }
 }
 
-impl<'d> Drop for SpiDriver<'d> {
+impl Drop for SpiDriver<'_> {
     fn drop(&mut self) {
         esp!(unsafe { spi_bus_free(self.host()) }).unwrap();
     }
 }
 
-unsafe impl<'d> Send for SpiDriver<'d> {}
+unsafe impl Send for SpiDriver<'_> {}
 
 pub struct SpiBusDriver<'d, T>
 where
     T: BorrowMut<SpiDriver<'d>>,
 {
-    _lock: BusLock,
+    lock: Option<BusLock>,
     handle: spi_device_handle_t,
     driver: T,
+    duplex: Duplex,
     polling: bool,
     queue_size: usize,
     _d: PhantomData<&'d ()>,
@@ -502,22 +637,8 @@ where
     T: BorrowMut<SpiDriver<'d>>,
 {
     pub fn new(driver: T, config: &config::Config) -> Result<Self, EspError> {
-        let conf = spi_device_interface_config_t {
-            spics_io_num: -1,
-            clock_speed_hz: config.baudrate.0 as i32,
-            mode: data_mode_to_u8(config.data_mode),
-            queue_size: config.queue_size as i32,
-            flags: if config.write_only {
-                SPI_DEVICE_NO_DUMMY
-            } else {
-                0_u32
-            } | config.duplex.as_flags()
-                | config.bit_order.as_flags(),
-            cs_ena_pretrans: config.cs_pre_delay_us.unwrap_or(0),
-            cs_ena_posttrans: config.cs_post_delay_us.unwrap_or(0),
-            post_cb: Some(spi_notify),
-            ..Default::default()
-        };
+        let mut conf: spi_device_interface_config_t = config.into();
+        conf.post_cb = Some(spi_notify);
 
         let mut handle: spi_device_handle_t = ptr::null_mut();
         esp!(unsafe { spi_bus_add_device(driver.borrow().host(), &conf, &mut handle as *mut _) })?;
@@ -525,9 +646,10 @@ where
         let lock = BusLock::new(handle)?;
 
         Ok(Self {
-            _lock: lock,
+            lock: Some(lock),
             handle,
             driver,
+            duplex: config.duplex,
             polling: config.polling,
             queue_size: config.queue_size,
             _d: PhantomData,
@@ -542,7 +664,7 @@ where
 
         let chunk_size = self.driver.borrow().max_transfer_size;
 
-        let transactions = spi_read_transactions(words, chunk_size);
+        let transactions = spi_read_transactions(words, chunk_size, self.duplex, LineWidth::Single);
         spi_transmit(self.handle, transactions, self.polling, self.queue_size)?;
 
         Ok(())
@@ -552,7 +674,7 @@ where
     pub async fn read_async(&mut self, words: &mut [u8]) -> Result<(), EspError> {
         let chunk_size = self.driver.borrow().max_transfer_size;
 
-        let transactions = spi_read_transactions(words, chunk_size);
+        let transactions = spi_read_transactions(words, chunk_size, self.duplex, LineWidth::Single);
         core::pin::pin!(spi_transmit_async(
             self.handle,
             transactions,
@@ -571,7 +693,7 @@ where
 
         let chunk_size = self.driver.borrow().max_transfer_size;
 
-        let transactions = spi_write_transactions(words, chunk_size);
+        let transactions = spi_write_transactions(words, chunk_size, LineWidth::Single);
         spi_transmit(self.handle, transactions, self.polling, self.queue_size)?;
 
         Ok(())
@@ -581,7 +703,7 @@ where
     pub async fn write_async(&mut self, words: &[u8]) -> Result<(), EspError> {
         let chunk_size = self.driver.borrow().max_transfer_size;
 
-        let transactions = spi_write_transactions(words, chunk_size);
+        let transactions = spi_write_transactions(words, chunk_size, LineWidth::Single);
         core::pin::pin!(spi_transmit_async(
             self.handle,
             transactions,
@@ -606,7 +728,7 @@ where
 
         let chunk_size = self.driver.borrow().max_transfer_size;
 
-        let transactions = spi_transfer_transactions(read, write, chunk_size);
+        let transactions = spi_transfer_transactions(read, write, chunk_size, self.duplex);
         spi_transmit(self.handle, transactions, self.polling, self.queue_size)?;
 
         Ok(())
@@ -616,7 +738,7 @@ where
     pub async fn transfer_async(&mut self, read: &mut [u8], write: &[u8]) -> Result<(), EspError> {
         let chunk_size = self.driver.borrow().max_transfer_size;
 
-        let transactions = spi_transfer_transactions(read, write, chunk_size);
+        let transactions = spi_transfer_transactions(read, write, chunk_size, self.duplex);
         core::pin::pin!(spi_transmit_async(
             self.handle,
             transactions,
@@ -654,6 +776,48 @@ where
     pub fn flush(&mut self) -> Result<(), EspError> {
         Ok(())
     }
+
+    /// Run the provided [`Operation`] on the bus.
+    ///
+    /// Only Operations that result in a transfer are supported. For example,
+    /// passing an [`Operation::DelayNs`] will return an error.
+    pub fn operation(&mut self, operation: Operation<'_>) -> Result<(), EspError> {
+        if let Operation::DelayNs(_) = operation {
+            return Err(EspError::from_infallible::<ESP_ERR_INVALID_ARG>());
+        }
+
+        let chunk_size = self.driver.borrow().max_transfer_size;
+        let transactions = spi_operations(once(operation), chunk_size, self.duplex)
+            .filter_map(|t| t.transaction());
+
+        spi_transmit(self.handle, transactions, self.polling, self.queue_size)?;
+
+        Ok(())
+    }
+
+    /// Run the provided [`Operation`] on the bus.
+    ///
+    /// Only Operations that result in a transfer are supported. For example,
+    /// passing an [`Operation::DelayNs`] will return an error.
+    #[cfg(not(esp_idf_spi_master_isr_in_iram))]
+    pub async fn operation_async(&mut self, operation: Operation<'_>) -> Result<(), EspError> {
+        if let Operation::DelayNs(_) = operation {
+            return Err(EspError::from_infallible::<ESP_ERR_INVALID_ARG>());
+        }
+
+        let chunk_size = self.driver.borrow().max_transfer_size;
+        let transactions = spi_operations(once(operation), chunk_size, self.duplex)
+            .filter_map(|t| t.transaction());
+
+        core::pin::pin!(spi_transmit_async(
+            self.handle,
+            transactions,
+            self.queue_size
+        ))
+        .await?;
+
+        Ok(())
+    }
 }
 
 impl<'d, T> Drop for SpiBusDriver<'d, T>
@@ -661,6 +825,10 @@ where
     T: BorrowMut<SpiDriver<'d>>,
 {
     fn drop(&mut self) {
+        // Need to drop the lock first, because it holds the device
+        // we are about to remove below
+        self.lock = None;
+
         esp!(unsafe { spi_bus_remove_device(self.handle) }).unwrap();
     }
 }
@@ -755,6 +923,7 @@ where
     handle: spi_device_handle_t,
     driver: T,
     cs_pin_configured: bool,
+    duplex: Duplex,
     polling: bool,
     allow_pre_post_delays: bool,
     queue_size: usize,
@@ -803,27 +972,9 @@ where
     ) -> Result<Self, EspError> {
         let cs = cs.map(|cs| cs.into_ref().pin()).unwrap_or(-1);
 
-        let conf = spi_device_interface_config_t {
-            spics_io_num: cs,
-            clock_speed_hz: config.baudrate.0 as i32,
-            mode: data_mode_to_u8(config.data_mode),
-            queue_size: config.queue_size as i32,
-            input_delay_ns: config.input_delay_ns,
-            flags: if config.write_only {
-                SPI_DEVICE_NO_DUMMY
-            } else {
-                0_u32
-            } | if config.cs_active_high {
-                SPI_DEVICE_POSITIVE_CS
-            } else {
-                0_u32
-            } | config.duplex.as_flags()
-                | config.bit_order.as_flags(),
-            post_cb: Some(spi_notify),
-            cs_ena_pretrans: config.cs_pre_delay_us.unwrap_or(0),
-            cs_ena_posttrans: config.cs_post_delay_us.unwrap_or(0),
-            ..Default::default()
-        };
+        let mut conf: spi_device_interface_config_t = config.into();
+        conf.spics_io_num = cs;
+        conf.post_cb = Some(spi_notify);
 
         let mut handle: spi_device_handle_t = ptr::null_mut();
         esp!(unsafe { spi_bus_add_device(driver.borrow().host(), &conf, &mut handle as *mut _) })?;
@@ -832,6 +983,7 @@ where
             handle,
             driver,
             cs_pin_configured: cs >= 0,
+            duplex: config.duplex,
             polling: config.polling,
             allow_pre_post_delays: config.allow_pre_post_delays,
             queue_size: config.queue_size,
@@ -843,7 +995,7 @@ where
         self.handle
     }
 
-    pub fn transaction(&mut self, operations: &mut [Operation<'_, u8>]) -> Result<(), EspError> {
+    pub fn transaction(&mut self, operations: &mut [Operation<'_>]) -> Result<(), EspError> {
         self.run(
             self.hardware_cs_ctl(operations.iter_mut().map(copy_operation))?,
             operations.iter_mut().map(copy_operation),
@@ -853,7 +1005,7 @@ where
     #[cfg(not(esp_idf_spi_master_isr_in_iram))]
     pub async fn transaction_async(
         &mut self,
-        operations: &mut [Operation<'_, u8>],
+        operations: &mut [Operation<'_>],
     ) -> Result<(), EspError> {
         core::pin::pin!(self.run_async(
             self.hardware_cs_ctl(operations.iter_mut().map(copy_operation))?,
@@ -868,7 +1020,9 @@ where
 
     #[cfg(not(esp_idf_spi_master_isr_in_iram))]
     pub async fn read_async(&mut self, read: &mut [u8]) -> Result<(), EspError> {
-        core::pin::pin!(self.transaction_async(&mut [Operation::Read(read)])).await
+        let mut operation = [Operation::Read(read)];
+        let work = core::pin::pin!(self.transaction_async(&mut operation));
+        work.await
     }
 
     pub fn write(&mut self, write: &[u8]) -> Result<(), EspError> {
@@ -877,7 +1031,9 @@ where
 
     #[cfg(not(esp_idf_spi_master_isr_in_iram))]
     pub async fn write_async(&mut self, write: &[u8]) -> Result<(), EspError> {
-        core::pin::pin!(self.transaction_async(&mut [Operation::Write(write)])).await
+        let mut operation = [Operation::Write(write)];
+        let work = core::pin::pin!(self.transaction_async(&mut operation));
+        work.await
     }
 
     pub fn transfer_in_place(&mut self, buf: &mut [u8]) -> Result<(), EspError> {
@@ -886,7 +1042,9 @@ where
 
     #[cfg(not(esp_idf_spi_master_isr_in_iram))]
     pub async fn transfer_in_place_async(&mut self, buf: &mut [u8]) -> Result<(), EspError> {
-        core::pin::pin!(self.transaction_async(&mut [Operation::TransferInPlace(buf)])).await
+        let mut operation = [Operation::TransferInPlace(buf)];
+        let work = core::pin::pin!(self.transaction_async(&mut operation));
+        work.await
     }
 
     pub fn transfer(&mut self, read: &mut [u8], write: &[u8]) -> Result<(), EspError> {
@@ -895,13 +1053,15 @@ where
 
     #[cfg(not(esp_idf_spi_master_isr_in_iram))]
     pub async fn transfer_async(&mut self, read: &mut [u8], write: &[u8]) -> Result<(), EspError> {
-        core::pin::pin!(self.transaction_async(&mut [Operation::Transfer(read, write)])).await
+        let mut operation = [Operation::Transfer(read, write)];
+        let work = core::pin::pin!(self.transaction_async(&mut operation));
+        work.await
     }
 
     fn run<'a, 'c, 'p, P, M>(
         &mut self,
         mut cs_pin: CsCtl<'c, 'p, P, M>,
-        operations: impl Iterator<Item = Operation<'a, u8>> + 'a,
+        operations: impl Iterator<Item = Operation<'a>> + 'a,
     ) -> Result<(), EspError>
     where
         P: OutputPin,
@@ -956,7 +1116,7 @@ where
     async fn run_async<'a, 'c, 'p, P, M>(
         &self,
         mut cs_pin: CsCtl<'c, 'p, P, M>,
-        operations: impl Iterator<Item = Operation<'a, u8>> + 'a,
+        operations: impl Iterator<Item = Operation<'a>> + 'a,
     ) -> Result<(), EspError>
     where
         P: OutputPin,
@@ -1020,7 +1180,7 @@ where
 
     fn hardware_cs_ctl<'a, 'c, 'p>(
         &self,
-        operations: impl Iterator<Item = Operation<'a, u8>> + 'a,
+        operations: impl Iterator<Item = Operation<'a>> + 'a,
     ) -> Result<CsCtl<'c, 'p, AnyOutputPin, Output>, EspError> {
         let (total_count, transactions_count, first_transaction, last_transaction) =
             self.spi_operations_stats(operations);
@@ -1042,7 +1202,7 @@ where
 
     fn spi_operations_stats<'a>(
         &self,
-        operations: impl Iterator<Item = Operation<'a, u8>> + 'a,
+        operations: impl Iterator<Item = Operation<'a>> + 'a,
     ) -> (usize, usize, Option<usize>, Option<usize>) {
         self.spi_operations(operations).enumerate().fold(
             (0, 0, None, None),
@@ -1069,57 +1229,11 @@ where
 
     fn spi_operations<'a>(
         &self,
-        operations: impl Iterator<Item = Operation<'a, u8>> + 'a,
+        operations: impl Iterator<Item = Operation<'a>> + 'a,
     ) -> impl Iterator<Item = SpiOperation> + 'a {
-        enum OperationsIter<R, W, T, I, D> {
-            Read(R),
-            Write(W),
-            Transfer(T),
-            TransferInPlace(I),
-            Delay(D),
-        }
-
-        impl<R, W, T, I, D> Iterator for OperationsIter<R, W, T, I, D>
-        where
-            R: Iterator<Item = SpiOperation>,
-            W: Iterator<Item = SpiOperation>,
-            T: Iterator<Item = SpiOperation>,
-            I: Iterator<Item = SpiOperation>,
-            D: Iterator<Item = SpiOperation>,
-        {
-            type Item = SpiOperation;
-
-            fn next(&mut self) -> Option<Self::Item> {
-                match self {
-                    Self::Read(iter) => iter.next(),
-                    Self::Write(iter) => iter.next(),
-                    Self::Transfer(iter) => iter.next(),
-                    Self::TransferInPlace(iter) => iter.next(),
-                    Self::Delay(iter) => iter.next(),
-                }
-            }
-        }
-
         let chunk_size = self.driver.borrow().max_transfer_size;
-
-        operations.flat_map(move |op| match op {
-            Operation::Read(words) => OperationsIter::Read(
-                spi_read_transactions(words, chunk_size).map(SpiOperation::Transaction),
-            ),
-            Operation::Write(words) => OperationsIter::Write(
-                spi_write_transactions(words, chunk_size).map(SpiOperation::Transaction),
-            ),
-            Operation::Transfer(read, write) => OperationsIter::Transfer(
-                spi_transfer_transactions(read, write, chunk_size).map(SpiOperation::Transaction),
-            ),
-            Operation::TransferInPlace(words) => OperationsIter::TransferInPlace(
-                spi_transfer_in_place_transactions(words, chunk_size)
-                    .map(SpiOperation::Transaction),
-            ),
-            Operation::DelayNs(delay) => {
-                OperationsIter::Delay(core::iter::once(SpiOperation::Delay(delay)))
-            }
-        })
+        let duplex = self.duplex;
+        spi_operations(operations, chunk_size, duplex)
     }
 }
 
@@ -1153,8 +1267,15 @@ where
         Self::write(self, buf).map_err(to_spi_err)
     }
 
-    fn transaction(&mut self, operations: &mut [Operation<'_, u8>]) -> Result<(), Self::Error> {
-        Self::transaction(self, operations).map_err(to_spi_err)
+    fn transaction(
+        &mut self,
+        operations: &mut [embedded_hal::spi::Operation<'_, u8>],
+    ) -> Result<(), Self::Error> {
+        self.run(
+            self.hardware_cs_ctl(operations.iter_mut().map(copy_ehal_operation))?,
+            operations.iter_mut().map(copy_ehal_operation),
+        )
+        .map_err(to_spi_err)
     }
 }
 
@@ -1214,8 +1335,13 @@ where
                 break;
             }
 
-            let mut transaction =
-                spi_create_transaction(core::ptr::null_mut(), buf[..offset].as_ptr(), offset, 0);
+            let mut transaction = spi_create_transaction(
+                core::ptr::null_mut(),
+                buf[..offset].as_ptr(),
+                offset,
+                0,
+                LineWidth::Single,
+            );
 
             if lock.is_none() && words.peek().is_some() {
                 lock = Some(BusLock::new(self.handle)?);
@@ -1281,11 +1407,14 @@ where
 
     async fn transaction(
         &mut self,
-        operations: &mut [Operation<'_, u8>],
+        operations: &mut [embedded_hal::spi::Operation<'_, u8>],
     ) -> Result<(), Self::Error> {
-        Self::transaction_async(self, operations)
-            .await
-            .map_err(to_spi_err)
+        core::pin::pin!(self.run_async(
+            self.hardware_cs_ctl(operations.iter_mut().map(copy_ehal_operation))?,
+            operations.iter_mut().map(copy_ehal_operation),
+        ))
+        .await
+        .map_err(to_spi_err)
     }
 }
 
@@ -1386,14 +1515,14 @@ where
         self
     }
 
-    pub fn transaction(&mut self, operations: &mut [Operation<'_, u8>]) -> Result<(), EspError> {
+    pub fn transaction(&mut self, operations: &mut [Operation<'_>]) -> Result<(), EspError> {
         self.run(operations.iter_mut().map(copy_operation))
     }
 
     #[cfg(not(esp_idf_spi_master_isr_in_iram))]
     pub async fn transaction_async(
         &mut self,
-        operations: &mut [Operation<'_, u8>],
+        operations: &mut [Operation<'_>],
     ) -> Result<(), EspError> {
         core::pin::pin!(self.run_async(operations.iter_mut().map(copy_operation))).await
     }
@@ -1404,7 +1533,9 @@ where
 
     #[cfg(not(esp_idf_spi_master_isr_in_iram))]
     pub async fn read_async(&mut self, read: &mut [u8]) -> Result<(), EspError> {
-        core::pin::pin!(self.transaction_async(&mut [Operation::Read(read)])).await
+        let mut operation = [Operation::Read(read)];
+        let work = core::pin::pin!(self.transaction_async(&mut operation));
+        work.await
     }
 
     pub fn write(&mut self, write: &[u8]) -> Result<(), EspError> {
@@ -1413,7 +1544,9 @@ where
 
     #[cfg(not(esp_idf_spi_master_isr_in_iram))]
     pub async fn write_async(&mut self, write: &[u8]) -> Result<(), EspError> {
-        core::pin::pin!(self.transaction_async(&mut [Operation::Write(write)])).await
+        let mut operation = [Operation::Write(write)];
+        let work = core::pin::pin!(self.transaction_async(&mut operation));
+        work.await
     }
 
     pub fn transfer_in_place(&mut self, buf: &mut [u8]) -> Result<(), EspError> {
@@ -1422,7 +1555,9 @@ where
 
     #[cfg(not(esp_idf_spi_master_isr_in_iram))]
     pub async fn transfer_in_place_async(&mut self, buf: &mut [u8]) -> Result<(), EspError> {
-        core::pin::pin!(self.transaction_async(&mut [Operation::TransferInPlace(buf)])).await
+        let mut operation = [Operation::TransferInPlace(buf)];
+        let work = core::pin::pin!(self.transaction_async(&mut operation));
+        work.await
     }
 
     pub fn transfer(&mut self, read: &mut [u8], write: &[u8]) -> Result<(), EspError> {
@@ -1431,12 +1566,14 @@ where
 
     #[cfg(not(esp_idf_spi_master_isr_in_iram))]
     pub async fn transfer_async(&mut self, read: &mut [u8], write: &[u8]) -> Result<(), EspError> {
-        core::pin::pin!(self.transaction_async(&mut [Operation::Transfer(read, write)])).await
+        let mut operation = [Operation::Transfer(read, write)];
+        let work = core::pin::pin!(self.transaction_async(&mut operation));
+        work.await
     }
 
     fn run<'a>(
         &mut self,
-        operations: impl Iterator<Item = Operation<'a, u8>> + 'a,
+        operations: impl Iterator<Item = Operation<'a>> + 'a,
     ) -> Result<(), EspError> {
         let cs_pin = CsCtl::Software {
             cs: &mut self.cs_pin,
@@ -1452,7 +1589,7 @@ where
     #[allow(dead_code)]
     async fn run_async<'a>(
         &mut self,
-        operations: impl Iterator<Item = Operation<'a, u8>> + 'a,
+        operations: impl Iterator<Item = Operation<'a>> + 'a,
     ) -> Result<(), EspError> {
         let cs_pin = CsCtl::Software {
             cs: &mut self.cs_pin,
@@ -1492,8 +1629,12 @@ where
         Self::write(self, buf).map_err(to_spi_err)
     }
 
-    fn transaction(&mut self, operations: &mut [Operation<'_, u8>]) -> Result<(), Self::Error> {
-        Self::transaction(self, operations).map_err(to_spi_err)
+    fn transaction(
+        &mut self,
+        operations: &mut [embedded_hal::spi::Operation<'_, u8>],
+    ) -> Result<(), Self::Error> {
+        self.run(operations.iter_mut().map(copy_ehal_operation))
+            .map_err(to_spi_err)
     }
 }
 
@@ -1514,9 +1655,9 @@ where
 
     async fn transaction(
         &mut self,
-        operations: &mut [Operation<'_, u8>],
+        operations: &mut [embedded_hal::spi::Operation<'_, u8>],
     ) -> Result<(), Self::Error> {
-        Self::transaction_async(self, operations)
+        core::pin::pin!(self.run_async(operations.iter_mut().map(copy_ehal_operation)))
             .await
             .map_err(to_spi_err)
     }
@@ -1576,7 +1717,7 @@ where
     },
 }
 
-impl<'c, 'p, P, M> CsCtl<'c, 'p, P, M>
+impl<P, M> CsCtl<'_, '_, P, M>
 where
     P: OutputPin,
     M: OutputMode,
@@ -1634,16 +1775,86 @@ where
     }
 }
 
+fn spi_operations<'a>(
+    operations: impl Iterator<Item = Operation<'a>> + 'a,
+    chunk_size: usize,
+    duplex: Duplex,
+) -> impl Iterator<Item = SpiOperation> + 'a {
+    enum OperationsIter<R, W, T, I, D> {
+        Read(R),
+        Write(W),
+        Transfer(T),
+        TransferInPlace(I),
+        Delay(D),
+    }
+
+    impl<R, W, T, I, D> Iterator for OperationsIter<R, W, T, I, D>
+    where
+        R: Iterator<Item = SpiOperation>,
+        W: Iterator<Item = SpiOperation>,
+        T: Iterator<Item = SpiOperation>,
+        I: Iterator<Item = SpiOperation>,
+        D: Iterator<Item = SpiOperation>,
+    {
+        type Item = SpiOperation;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            match self {
+                Self::Read(iter) => iter.next(),
+                Self::Write(iter) => iter.next(),
+                Self::Transfer(iter) => iter.next(),
+                Self::TransferInPlace(iter) => iter.next(),
+                Self::Delay(iter) => iter.next(),
+            }
+        }
+    }
+
+    operations.flat_map(move |op| match op {
+        Operation::Read(words) => OperationsIter::Read(
+            spi_read_transactions(words, chunk_size, duplex, LineWidth::Single)
+                .map(SpiOperation::Transaction),
+        ),
+        Operation::ReadWithWidth(words, line_width) => OperationsIter::Read(
+            spi_read_transactions(words, chunk_size, duplex, line_width)
+                .map(SpiOperation::Transaction),
+        ),
+        Operation::Write(words) => OperationsIter::Write(
+            spi_write_transactions(words, chunk_size, LineWidth::Single)
+                .map(SpiOperation::Transaction),
+        ),
+        Operation::WriteWithWidth(words, line_width) => OperationsIter::Write(
+            spi_write_transactions(words, chunk_size, line_width).map(SpiOperation::Transaction),
+        ),
+        Operation::Transfer(read, write) => OperationsIter::Transfer(
+            spi_transfer_transactions(read, write, chunk_size, duplex)
+                .map(SpiOperation::Transaction),
+        ),
+        Operation::TransferInPlace(words) => OperationsIter::TransferInPlace(
+            spi_transfer_in_place_transactions(words, chunk_size).map(SpiOperation::Transaction),
+        ),
+        Operation::DelayNs(delay) => {
+            OperationsIter::Delay(core::iter::once(SpiOperation::Delay(delay)))
+        }
+    })
+}
+
 fn spi_read_transactions(
     words: &mut [u8],
     chunk_size: usize,
+    duplex: Duplex,
+    line_width: LineWidth,
 ) -> impl Iterator<Item = spi_transaction_t> + '_ {
-    words.chunks_mut(chunk_size).map(|chunk| {
+    words.chunks_mut(chunk_size).map(move |chunk| {
         spi_create_transaction(
             chunk.as_mut_ptr(),
             core::ptr::null(),
+            if duplex == Duplex::Full {
+                chunk.len()
+            } else {
+                0
+            },
             chunk.len(),
-            chunk.len(),
+            line_width,
         )
     })
 }
@@ -1651,10 +1862,17 @@ fn spi_read_transactions(
 fn spi_write_transactions(
     words: &[u8],
     chunk_size: usize,
+    line_width: LineWidth,
 ) -> impl Iterator<Item = spi_transaction_t> + '_ {
-    words
-        .chunks(chunk_size)
-        .map(|chunk| spi_create_transaction(core::ptr::null_mut(), chunk.as_ptr(), chunk.len(), 0))
+    words.chunks(chunk_size).map(move |chunk| {
+        spi_create_transaction(
+            core::ptr::null_mut(),
+            chunk.as_ptr(),
+            chunk.len(),
+            0,
+            line_width,
+        )
+    })
 }
 
 fn spi_transfer_in_place_transactions(
@@ -1667,6 +1885,7 @@ fn spi_transfer_in_place_transactions(
             chunk.as_mut_ptr(),
             chunk.len(),
             chunk.len(),
+            LineWidth::Single,
         )
     })
 }
@@ -1675,6 +1894,7 @@ fn spi_transfer_transactions<'a>(
     read: &'a mut [u8],
     write: &'a [u8],
     chunk_size: usize,
+    duplex: Duplex,
 ) -> impl Iterator<Item = spi_transaction_t> + 'a {
     enum OperationsIter<E, R, W> {
         Equal(E),
@@ -1707,16 +1927,18 @@ fn spi_transfer_transactions<'a>(
             let (read, read_trail) = read.split_at_mut(write.len());
 
             OperationsIter::ReadLonger(
-                spi_transfer_equal_transactions(read, write, chunk_size)
-                    .chain(spi_read_transactions(read_trail, chunk_size)),
+                spi_transfer_equal_transactions(read, write, chunk_size).chain(
+                    spi_read_transactions(read_trail, chunk_size, duplex, LineWidth::Single),
+                ),
             )
         }
         Ordering::Less => {
             let (write, write_trail) = write.split_at(read.len());
 
             OperationsIter::WriteLonger(
-                spi_transfer_equal_transactions(read, write, chunk_size)
-                    .chain(spi_write_transactions(write_trail, chunk_size)),
+                spi_transfer_equal_transactions(read, write, chunk_size).chain(
+                    spi_write_transactions(write_trail, chunk_size, LineWidth::Single),
+                ),
             )
         }
     }
@@ -1735,6 +1957,7 @@ fn spi_transfer_equal_transactions<'a>(
                 write_chunk.as_ptr(),
                 max(read_chunk.len(), write_chunk.len()),
                 read_chunk.len(),
+                LineWidth::Single,
             )
         })
 }
@@ -1745,9 +1968,15 @@ fn spi_create_transaction(
     write: *const u8,
     transaction_length: usize,
     rx_length: usize,
+    line_width: LineWidth,
 ) -> spi_transaction_t {
+    let flags = match line_width {
+        LineWidth::Single => 0,
+        LineWidth::Dual => SPI_TRANS_MODE_DIO,
+        LineWidth::Quad => SPI_TRANS_MODE_QIO,
+    };
     spi_transaction_t {
-        flags: 0,
+        flags,
         __bindgen_anon_1: spi_transaction_t__bindgen_ty_1 {
             tx_buffer: write as *const _,
         },
@@ -1846,7 +2075,7 @@ async fn spi_transmit_async(
 
             let last = queue.back_mut().unwrap();
             last.0.user = &last.1 as *const _ as *mut _;
-            match esp!(unsafe { spi_device_queue_trans(handle, &mut last.0, delay::NON_BLOCK) }) {
+            match esp!(unsafe { spi_device_queue_trans(handle, &mut last.0, delay::BLOCK) }) {
                 Err(e) if e.code() == ESP_ERR_TIMEOUT => unreachable!(),
                 other => other,
             }
@@ -1857,9 +2086,10 @@ async fn spi_transmit_async(
             match esp!(unsafe {
                 spi_device_get_trans_result(handle, &mut rtrans, delay::NON_BLOCK)
             }) {
-                Err(e) if e.code() == ESP_ERR_TIMEOUT => unreachable!(),
-                other => other,
-            }?;
+                Err(e) if e.code() == ESP_ERR_TIMEOUT => return Ok(false),
+                Err(e) => Err(e)?,
+                Ok(()) => (),
+            };
 
             if rtrans != &mut queue.front_mut().unwrap().0 {
                 unreachable!();
@@ -1868,14 +2098,17 @@ async fn spi_transmit_async(
             queue.pop_front().unwrap();
             queued.set(queue.len());
 
-            Ok(())
+            Ok(true)
         };
 
         for transaction in transactions {
-            if queue.len() == queue_size {
+            while queue.len() == queue_size {
+                if pop(queue)? {
+                    break;
+                }
+
                 // If the queue is full, we wait for the first transaction in the queue
                 queue.front_mut().unwrap().1.wait().await;
-                pop(queue)?;
             }
 
             // Write transaction to a stable memory location
@@ -1883,8 +2116,9 @@ async fn spi_transmit_async(
         }
 
         while !queue.is_empty() {
-            queue.front_mut().unwrap().1.wait().await;
-            pop(queue)?;
+            if !pop(queue)? {
+                queue.front_mut().unwrap().1.wait().await;
+            }
         }
 
         Ok(())
@@ -1912,19 +2146,30 @@ extern "C" fn spi_notify(transaction: *mut spi_transaction_t) {
     }
 }
 
-fn copy_operation<'b>(operation: &'b mut Operation<'_, u8>) -> Operation<'b, u8> {
+fn copy_operation<'b>(operation: &'b mut Operation<'_>) -> Operation<'b> {
     match operation {
         Operation::Read(read) => Operation::Read(read),
+        Operation::ReadWithWidth(read, line_width) => Operation::ReadWithWidth(read, *line_width),
         Operation::Write(write) => Operation::Write(write),
+        Operation::WriteWithWidth(write, line_width) => {
+            Operation::WriteWithWidth(write, *line_width)
+        }
         Operation::Transfer(read, write) => Operation::Transfer(read, write),
         Operation::TransferInPlace(write) => Operation::TransferInPlace(write),
         Operation::DelayNs(delay) => Operation::DelayNs(*delay),
     }
 }
 
-fn data_mode_to_u8(data_mode: config::Mode) -> u8 {
-    (((data_mode.polarity == config::Polarity::IdleHigh) as u8) << 1)
-        | ((data_mode.phase == config::Phase::CaptureOnSecondTransition) as u8)
+fn copy_ehal_operation<'b>(
+    operation: &'b mut embedded_hal::spi::Operation<'_, u8>,
+) -> Operation<'b> {
+    match operation {
+        embedded_hal::spi::Operation::Read(read) => Operation::Read(read),
+        embedded_hal::spi::Operation::Write(write) => Operation::Write(write),
+        embedded_hal::spi::Operation::Transfer(read, write) => Operation::Transfer(read, write),
+        embedded_hal::spi::Operation::TransferInPlace(write) => Operation::TransferInPlace(write),
+        embedded_hal::spi::Operation::DelayNs(delay) => Operation::DelayNs(*delay),
+    }
 }
 
 #[allow(dead_code)]

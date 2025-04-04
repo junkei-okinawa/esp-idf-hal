@@ -547,7 +547,7 @@ impl<'d> TimerDriver<'d> {
     }
 }
 
-impl<'d> Drop for TimerDriver<'d> {
+impl Drop for TimerDriver<'_> {
     fn drop(&mut self) {
         self.disable_interrupt().unwrap();
 
@@ -562,9 +562,9 @@ impl<'d> Drop for TimerDriver<'d> {
     }
 }
 
-unsafe impl<'d> Send for TimerDriver<'d> {}
+unsafe impl Send for TimerDriver<'_> {}
 
-impl<'d> embedded_hal_async::delay::DelayNs for TimerDriver<'d> {
+impl embedded_hal_async::delay::DelayNs for TimerDriver<'_> {
     async fn delay_ns(&mut self, ns: u32) {
         let counter = core::cmp::max((self.tick_hz() * ns as u64) / 1000000, 1);
 

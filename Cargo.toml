@@ -1,6 +1,6 @@
 [package]
 name = "esp-idf-hal"
-version = "0.44.1"
+version = "0.45.2"
 authors = ["sapir <yasapir@gmail.com>", "Ivan Markov <ivan.markov@gmail.com>"]
 edition = "2021"
 resolver = "2"
@@ -23,6 +23,7 @@ default = ["std", "binstart"]
 std = ["alloc", "esp-idf-sys/std"]
 alloc = []
 nightly = []
+experimental = []
 wake-from-isr = [] # Only enable if you plan to use the `edge-executor` crate
 embassy-sync = [] # For now, the dependecy on the `embassy-sync` crate is non-optional, but this might change in future
 # Temporary, until (https://github.com/espressif/esp-idf/issues/13938) is addressed
@@ -30,6 +31,10 @@ embassy-sync = [] # For now, the dependecy on the `embassy-sync` crate is non-op
 # - When not enabled (default) the code for the new ADC oneshot driver will be compiled;
 # - Since we don't wrap the legacy _continuous_ ADC driver, the new _continuous_ ADC driver is always compiled.
 adc-oneshot-legacy = []
+# Similar to adc-oneshot-legacy
+# - When enabled (default), the code for the legacy RMT TX/RX driver will be compiled.
+# - When disabled the code for the new onewire RMT driver will be compiled. 
+rmt-legacy = []
 # Propagated esp-idf-sys features
 native = ["esp-idf-sys/native"]
 pio = ["esp-idf-sys/pio"]
@@ -47,21 +52,21 @@ embedded-hal-nb = "1"
 embedded-hal-async = "1"
 embedded-io = "0.6"
 embedded-io-async = "0.6"
-esp-idf-sys = { version = "0.35", default-features = false }
+esp-idf-sys = { version = "0.36", default-features = false }
 critical-section = { version = "1.1.1", optional = true, features = ["restore-state-none"] }
 heapless = "0.8"
 num_enum = { version = "0.7", default-features = false }
-enumset = { version = "1.1", default-features = false }
+enumset = { version = "1.1.4", default-features = false }
 log = { version = "0.4", default-features = false }
 atomic-waker = { version = "1.1.1", default-features = false }
 embassy-sync = { version = "0.6" }
 
 [build-dependencies]
-embuild = "0.32"
+embuild = "0.33"
 
 [dev-dependencies]
 anyhow = "1"
-esp-idf-sys = { version = "0.35", features = ["binstart"] }
+esp-idf-sys = { version = "0.36", features = ["binstart"] }
 mipidsi = "0.5.0"
 display-interface-spi = "0.4.1"
 embedded-graphics = "0.7.1"

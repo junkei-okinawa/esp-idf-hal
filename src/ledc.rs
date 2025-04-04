@@ -3,8 +3,6 @@
 //! Interface to the [LED Control (LEDC)
 //! peripheral](https://docs.espressif.com/projects/esp-idf/en/latest/esp32c3/api-reference/peripherals/ledc.html)
 //!
-//! This is an initial implementation supporting the generation of PWM signals
-//! but no chrome and spoilers like fading.
 //!
 //! # Examples
 //!
@@ -15,10 +13,10 @@
 //! use esp_idf_hal::prelude::*;
 //!
 //! let peripherals = Peripherals::take().unwrap();
-//! let timer_driver = LedcTimerDriver::new(peripherals.ledc.timer0, &TimerConfig::default().frequency(25.kHz().into()));
+//! let timer_driver = LedcTimerDriver::new(peripherals.ledc.timer0, &TimerConfig::default().frequency(25.kHz().into()))?;
 //! let mut driver = LedcDriver::new(peripherals.ledc.channel0, timer_driver, peripherals.pins.gpio1)?;
 //!
-//! let max_duty = driver.get_max_duty()?;
+//! let max_duty = driver.get_max_duty();
 //! driver.set_duty(max_duty * 3 / 4)?;
 //! ```
 //!
@@ -171,7 +169,7 @@ where
     }
 }
 
-impl<'d, T> Drop for LedcTimerDriver<'d, T>
+impl<T> Drop for LedcTimerDriver<'_, T>
 where
     T: LedcTimer,
 {
@@ -180,7 +178,7 @@ where
     }
 }
 
-unsafe impl<'d, T> Send for LedcTimerDriver<'d, T> where T: LedcTimer {}
+unsafe impl<T> Send for LedcTimerDriver<'_, T> where T: LedcTimer {}
 
 /// LED Control driver
 pub struct LedcDriver<'d> {
@@ -323,17 +321,80 @@ impl<'d> LedcDriver<'d> {
     pub fn timer(&self) -> ledc_timer_t {
         self.timer as _
     }
+
+    /// Fade the LED to a target duty cycle over a specified time
+    pub fn fade_with_time(
+        &mut self,
+        target_duty: u32,
+        fade_time_ms: i32,
+        wait: bool,
+    ) -> Result<(), EspError> {
+        let max_duty = self.get_max_duty();
+        if target_duty > max_duty {
+            return Err(EspError::from_infallible::<ESP_ERR_INVALID_ARG>());
+        }
+
+        let fade_mode = if wait {
+            ledc_fade_mode_t_LEDC_FADE_WAIT_DONE
+        } else {
+            ledc_fade_mode_t_LEDC_FADE_NO_WAIT
+        };
+
+        unsafe {
+            esp!(ledc_set_fade_with_time(
+                self.speed_mode,
+                self.channel(),
+                target_duty,
+                fade_time_ms
+            ))?;
+            esp!(ledc_fade_start(self.speed_mode, self.channel(), fade_mode))?;
+        }
+        Ok(())
+    }
+
+    /// Fade the LED to a target duty cycle using steps
+    pub fn fade_with_step(
+        &mut self,
+        target_duty: u32,
+        step_size: u32,
+        step_time_ms: u32,
+        wait: bool,
+    ) -> Result<(), EspError> {
+        let max_duty = self.get_max_duty();
+        if target_duty > max_duty {
+            return Err(EspError::from_infallible::<ESP_ERR_INVALID_ARG>());
+        }
+
+        let fade_mode = if wait {
+            ledc_fade_mode_t_LEDC_FADE_WAIT_DONE
+        } else {
+            ledc_fade_mode_t_LEDC_FADE_NO_WAIT
+        };
+
+        unsafe {
+            esp!(ledc_set_fade_with_step(
+                self.speed_mode,
+                self.channel(),
+                target_duty,
+                step_size,
+                step_time_ms,
+            ))?;
+
+            esp!(ledc_fade_start(self.speed_mode, self.channel(), fade_mode))?;
+        }
+        Ok(())
+    }
 }
 
-impl<'d> Drop for LedcDriver<'d> {
+impl Drop for LedcDriver<'_> {
     fn drop(&mut self) {
         self.stop().unwrap();
     }
 }
 
-unsafe impl<'d> Send for LedcDriver<'d> {}
+unsafe impl Send for LedcDriver<'_> {}
 
-impl<'d> embedded_hal::pwm::ErrorType for LedcDriver<'d> {
+impl embedded_hal::pwm::ErrorType for LedcDriver<'_> {
     type Error = PwmError;
 }
 
@@ -341,7 +402,7 @@ fn to_pwm_err(err: EspError) -> PwmError {
     PwmError::other(err)
 }
 
-impl<'d> embedded_hal::pwm::SetDutyCycle for LedcDriver<'d> {
+impl embedded_hal::pwm::SetDutyCycle for LedcDriver<'_> {
     fn max_duty_cycle(&self) -> u16 {
         let duty = self.get_max_duty();
         let duty_cap: u16 = if duty > u16::MAX as u32 {
@@ -374,7 +435,7 @@ impl<'d> embedded_hal::pwm::SetDutyCycle for LedcDriver<'d> {
     }
 }
 
-impl<'d> embedded_hal_0_2::PwmPin for LedcDriver<'d> {
+impl embedded_hal_0_2::PwmPin for LedcDriver<'_> {
     type Duty = Duty;
 
     fn disable(&mut self) {

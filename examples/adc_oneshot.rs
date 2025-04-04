@@ -1,12 +1,15 @@
 //! ADC oneshot example, reading a value form a pin and printing it on the terminal
 //! requires ESP-IDF v5.0 or newer
 
+#![allow(unknown_lints)]
+#![allow(unexpected_cfgs)]
+
 use std::thread;
 use std::time::Duration;
 
 #[cfg(not(any(feature = "adc-oneshot-legacy", esp_idf_version_major = "4")))]
 fn main() -> anyhow::Result<()> {
-    use esp_idf_hal::adc::attenuation::DB_11;
+    use esp_idf_hal::adc::attenuation::DB_12;
     use esp_idf_hal::adc::oneshot::config::AdcChannelConfig;
     use esp_idf_hal::adc::oneshot::*;
     use esp_idf_hal::peripherals::Peripherals;
@@ -22,8 +25,7 @@ fn main() -> anyhow::Result<()> {
     // configuring pin to analog read, you can regulate the adc input voltage range depending on your need
     // for this example we use the attenuation of 11db which sets the input voltage range to around 0-3.6V
     let config = AdcChannelConfig {
-        attenuation: DB_11,
-        calibration: true,
+        attenuation: DB_12,
         ..Default::default()
     };
 

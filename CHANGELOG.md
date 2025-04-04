@@ -5,6 +5,67 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Deprecated
+- `DB_11` ADC attenuation in favor of `DB_12` for ESP-IDF V5.0+
+
+### Added
+- `Send` for `AsyncCanDriver`
+- `DB_12` ADC attenuation
+- `fade_with_time`, `fade_with_step` for `LedcDriver`
+
+### Fixed
+- Fix pcnt_rotary_encoder example for esp32
+- Fix the SDMMC driver for ESP-IDF V5.5+
+- Replace Arc with Rc in ledc_threads example (#514)
+- Fix outdated task docs
+
+## [0.45.2] - 2025-01-15
+
+### Fixed
+- Fix ledc example (#511)
+- Fix missing sdspi_host_get_dma_info for sdcard driver bug (#509)
+
+## [0.45.1] - 2025-01-10
+
+### Fixed
+- Fix RGB to u32 conversion order in rmt_neopixel example (#505)
+- Fix missing sdmmc_host_get_dma_info for sdcard driver bug (#507)
+
+## [0.45.0] - 2025-01-02
+
+### Deprecated
+
+### Breaking
+- Make the UART config to ESP-IDF  C config reusable outside the UART driver (for OpenThread)
+- Re-use the SPI config struct of the SPI driver (for OpenThread)
+- Add a `usb_serial` peripheral to the `Peripherals` struct for MCUs that do support the USB-serial-jtag peripheral (#503)
+- UART default baud rate changed from 19'200 to 115'200
+
+### Added
+- Compatibility with ESP-IDF v5.3.X
+- Docs: Add some docstrings for ADC module. (#455)
+- Update uart.rs, add rs485 half duplex (#456)
+- Update spi.rs, fix half3wire read (#459)
+- SPI: Mark DMA as supported in the docu
+- SD Card driver; SD Card host drivers (SPI and SDMMC) (#457)
+- RMT Onewire Peripheral (#454)
+- Add an example of using interrupt directly without async (#474)
+- Add support for ESP internal temperature sensor (#337)
+- Support the thread modem peripheral on the c6 MCU
+- Add dual and quad SPI support (#479)
+- Initial USB-serial-jtag driver (#504)
+
+### Fixed
+- Fix: UartDriver as embedded_io::Read blocks until buffer is full (#475)
+- Allow modem splits even when only HW coex is used
+- Fix esp_reset_reason_t constant names (#483)
+- Fix drop for AdcDriver in deregister event callbacks (#487)
+- Typo fix in task docs (#489)
+- Update spi.rs for correct label in gpio_cs capture (#492)
+- Fix a crash when dropping `SpiDriver`
+
 ## [0.44.1] - 2024-07-09
 ### Fixed
 * The crate now does build with ESP-IDF V4.4.x + esp32c2/esp32c6/esp32h2, yet these MCUs should only be used with ESP-IDF V5+ 
